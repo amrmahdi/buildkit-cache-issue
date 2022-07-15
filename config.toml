@@ -1,0 +1,7 @@
+[registry."localhost:5000"]
+    http = true
+    insecure = true
+[worker.oci]
+    enabled = false
+[worker.containerd]
+    enabled = true
