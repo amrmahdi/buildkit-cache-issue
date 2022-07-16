@@ -45,6 +45,7 @@ buildctl-daemonless() {
 }
 
 function cleanup {
+    removeImages
     stop_registry
 }
 
