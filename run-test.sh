@@ -1,81 +1,105 @@
 #!/bin/bash
 set -e
 
-function cleanup {
-    if [[ -n "$BUILDKITD_PID" ]]; then
-        echo "Stopping buildkitd"
-        kill "$BUILDKITD_PID"
-    fi
-    if [[ -n "$CONTAINERD_PID" ]]; then
-        echo "Stopping containerd"
-        kill "$CONTAINERD_PID"
-    fi
+IMAGE=moby/buildkit:master-rootless
 
-    stop_registry
+title() {
+  echo $'=== \e[1m'$@$'\e[0m'
 }
 
-function pruneEverything {
-    echo "Pruning everything"
-    buildctl prune --all
-    ctr -n buildkit images rm $(ctr -n buildkit images ls -q)
-    ctr -n buildkit content rm $(ctr -n buildkit content ls -q)
+error() {
+  echo $'\e[1;31m'$@$'\e[0m'
+}
+
+success() {
+  echo $'\e[1;32m'$@$'\e[0m'
 }
 
 start_registry() {
-  echo "Start local registry for caching"
-  registry_cache=$(docker run -d -p 5000:5000 --restart=always --name registry registry:2)
+    title "Start local registry for caching"
+    registry_cache=$(docker run -p 5000:5000 -d registry:2)
 }
 
 stop_registry() {
   if [ -n "$registry_cache" ]
   then
-    echo "Stop local registry for caching"
+    title "Stop local registry for caching"
     docker rm -vf $registry_cache
   fi
 }
 
-command -v containerd >/dev/null && echo "containerd found..." || { echo "containerd not installed."; exit 1; }
-command -v buildkitd >/dev/null && echo "buildkitd found..." || { echo "buildkitd not installed."; exit 1; }
-command -v buildctl >/dev/null && echo "buildctl found..." || { echo "buildctl not installed."; exit 1; }
+buildctl-daemonless() {
+    links="$links --link $registry_cache:registry-cache"
+    docker run \
+    --security-opt seccomp=unconfined \
+    --security-opt apparmor=unconfined \
+    -v $(pwd)/context:/context \
+    -v $(pwd)/config.toml:/etc/buildkit/buildkitd.toml \
+    -e BUILDKITD_FLAGS='--oci-worker-no-process-sandbox --config /etc/buildkit/buildkitd.toml' \
+    --rm \
+    -ti \
+    --entrypoint buildctl-daemonless.sh \
+    $links \
+    ${IMAGE} \
+    "$@"
+}
+
+function cleanup {
+    stop_registry
+}
+
+removeImages() {
+    title "Removing images from docker daemon"
+    docker rmi $(docker images localhost:5000/* -a -q)
+}
 
 trap cleanup EXIT
-echo "Starting containerd"
-containerd &
-CONTAINERD_PID=$!
-echo "Starting buildkitd"
-buildkitd --config ./config.toml &
-BUILDKITD_PID=$!
-
-sleep 10
-
-pruneEverything
 
 start_registry
 
-echo "Building and exporting parent image"
-pushd .
-cd simple
-buildctl build . --frontend dockerfile.v0 --local context=. --local dockerfile=. --output type=image,oci-mediatypes=true,name=amr.cr/foo:bar --export-cache=type=registry,ref=localhost:5000/cache/simple:0
-popd
-echo "Building and exporting child image"
-pushd .
-cd simple-child
-buildctl build . --frontend dockerfile.v0 --local context=. --local dockerfile=. --output type=image,oci-mediatypes=true,name=amr.cr/foochild:bar --export-cache=type=registry,name=localhost:5000/cache/simplechild:0
-popd
+title "Building and exporting parent image"
+buildctl-daemonless build . --frontend dockerfile.v0 --local context=/context/simple --local dockerfile=/context/simple --output type=image,oci-mediatypes=true,name=registry-cache:5000/foo:bar,push=true --export-cache=type=registry,ref=registry-cache:5000/cache/simple:0
 
-ctr -n buildkit images ls
+title "Building and exporting child image"
+buildctl-daemonless build . --frontend dockerfile.v0 --local context=/context/simple-child --local dockerfile=/context/simple-child --output type=image,oci-mediatypes=true,name=registry-cache:5000/foochild:bar,push=true --export-cache=type=registry,name=registry-cache:5000/cache/simplechild:0
 
-pruneEverything
+title "Pulling images to docker daemon for inspection"
+docker pull localhost:5000/foo:bar
+docker pull localhost:5000/foochild:bar
+docker images localhost:5000/*
 
-echo "Building (with import-from) parent image"
-pushd .
-cd simple
-buildctl build . --frontend dockerfile.v0 --local context=. --local dockerfile=. --output type=image,oci-mediatypes=true,name=amr.cr/foo:bar --import-cache=type=registry,ref=localhost:5000/cache/simple:0
-popd
-echo "Building (with import-from) child image"
-pushd .
-cd simple-child
-buildctl build . --frontend dockerfile.v0 --local context=. --local dockerfile=. --output type=image,oci-mediatypes=true,name=amr.cr/foochild:bar --import-cache=type=registry,name=localhost:5000/cache/simplechild:0
-popd
+original_foo_id=$(docker images localhost:5000/foo:bar -q)
+original_foochild_id=$(docker images localhost:5000/foochild:bar -q)
 
-ctr -n buildkit images ls
+removeImages
+
+title "Building (with import-from) parent image"
+buildctl-daemonless build . --frontend dockerfile.v0 --local context=/context/simple --local dockerfile=/context/simple --output type=image,oci-mediatypes=true,name=registry-cache:5000/foo:bar,push=true --import-cache=type=registry,ref=registry-cache:5000/cache/simple:0
+
+title "Building (with import-from) child image"
+buildctl-daemonless build . --frontend dockerfile.v0 --local context=/context/simple-child --local dockerfile=/context/simple-child --output type=image,oci-mediatypes=true,name=registry-cache:5000/foochild:bar,push=true --import-cache=type=registry,name=registry-cache:5000/cache/simplechild:0
+
+title "Pulling images to docker daemon for inspection"
+docker pull localhost:5000/foo:bar
+docker pull localhost:5000/foochild:bar
+docker images localhost:5000/*
+
+rebuild_original_foo_id=$(docker images localhost:5000/foo:bar -q)
+rebuild_original_foochild_id=$(docker images localhost:5000/foochild:bar -q)
+
+# Check if the images are the same
+if [ "$original_foo_id" != "$rebuild_original_foo_id" ]
+then
+  error "Base Image IDs do not match: ${original_foo_id} != ${rebuild_original_foo_id}"
+  exit 1
+else
+    success "Base Image IDs match: ${original_foo_id} == ${rebuild_original_foo_id}"
+fi
+
+if [ "$original_foochild_id" != "$rebuild_original_foochild_id" ]
+then
+  error "Child Image IDs do not match: ${original_foochild_id} != ${rebuild_original_foochild_id}"
+  exit 1
+else
+    success "Child Image IDs match: ${original_foochild_id} == ${rebuild_original_foochild_id}"
+fi

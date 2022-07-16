@@ -5,10 +5,4 @@ We next build the 2 images and export them to a registry cache. Now when we clea
 
 ## How to reproduce
 
-Clone this repository and run `sudo ./run-test.sh`.
-
-The script will try to reproduce the issue with the following steps:
-- Starts containerd and buildkitd (using containerd worker) and prunes the cache
-- Builds the 2 images using `--export-cache` to cache it to a local registry and prints their digests
-- Cleans the cache again and builds the 2 images using `--import-cache` to use the local registry cache and prints their digests
-- Cleanup all started processes, registry etc.
+Clone this repository and run `make run`.

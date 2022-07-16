@@ -1,4 +1,4 @@
-FROM amr.cr/foo:bar
+FROM registry-cache:5000/foo:bar
 
 # ENV foo 10
 
