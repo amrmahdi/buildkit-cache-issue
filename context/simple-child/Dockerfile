@@ -1,4 +1,5 @@
-FROM registry-cache:5000/foo:bar
+ARG BASE
+FROM $BASE
 
 # ENV foo 10
 

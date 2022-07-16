@@ -45,7 +45,7 @@ buildctl-daemonless() {
 }
 
 function cleanup {
-    removeImages
+    removeImages || true
     stop_registry
 }
 
@@ -54,53 +54,52 @@ removeImages() {
     docker rmi $(docker images localhost:5000/* -a -q)
 }
 
-trap cleanup EXIT
+trap cleanup EXIT ERR
 
 start_registry
 
 title "Building and exporting parent image"
-buildctl-daemonless build . --frontend dockerfile.v0 --local context=/context/simple --local dockerfile=/context/simple --output type=image,oci-mediatypes=true,name=registry-cache:5000/foo:bar,push=true --export-cache=type=registry,ref=registry-cache:5000/cache/simple:0
-
-title "Building and exporting child image"
-buildctl-daemonless build . --frontend dockerfile.v0 --local context=/context/simple-child --local dockerfile=/context/simple-child --output type=image,oci-mediatypes=true,name=registry-cache:5000/foochild:bar,push=true --export-cache=type=registry,name=registry-cache:5000/cache/simplechild:0
+buildctl-daemonless build . --frontend dockerfile.v0 --local context=/context/simple --local dockerfile=/context/simple --output type=image,name=registry-cache:5000/foo:bar,push=true --export-cache=type=registry,ref=registry-cache:5000/cache/simple:0
 
 title "Pulling images to docker daemon for inspection"
 docker pull localhost:5000/foo:bar
-docker pull localhost:5000/foochild:bar
-docker images localhost:5000/*
+original_foo_id=$(docker inspect --format='{{index .RepoDigests 0}}' localhost:5000/foo:bar | cut -d'@' -f 2)
 
-original_foo_id=$(docker images localhost:5000/foo:bar -q)
-original_foochild_id=$(docker images localhost:5000/foochild:bar -q)
+title "Building and exporting child image"
+buildctl-daemonless build . --opt build-arg:BASE=registry-cache:5000/foo:bar@${original_foo_id} --frontend dockerfile.v0 --local context=/context/simple-child --local dockerfile=/context/simple-child --output type=image,name=registry-cache:5000/foochild:bar,push=true --export-cache=type=registry,name=registry-cache:5000/cache/simplechild:0
+
+title "Pulling images to docker daemon for inspection"
+docker pull localhost:5000/foochild:bar
+original_foochild_id=$(docker inspect --format='{{index .RepoDigests 0}}' localhost:5000/foochild:bar | cut -d'@' -f 2)
 
 removeImages
 
 title "Building (with import-from) parent image"
-buildctl-daemonless build . --frontend dockerfile.v0 --local context=/context/simple --local dockerfile=/context/simple --output type=image,oci-mediatypes=true,name=registry-cache:5000/foo:bar,push=true --import-cache=type=registry,ref=registry-cache:5000/cache/simple:0
+buildctl-daemonless build . --frontend dockerfile.v0 --local context=/context/simple --local dockerfile=/context/simple --output type=image,name=registry-cache:5000/foo:bar,push=true --import-cache=type=registry,ref=registry-cache:5000/cache/simple:0
 
 title "Building (with import-from) child image"
-buildctl-daemonless build . --frontend dockerfile.v0 --local context=/context/simple-child --local dockerfile=/context/simple-child --output type=image,oci-mediatypes=true,name=registry-cache:5000/foochild:bar,push=true --import-cache=type=registry,name=registry-cache:5000/cache/simplechild:0
+buildctl-daemonless build . --frontend dockerfile.v0 --opt build-arg:BASE=registry-cache:5000/foo:bar@${original_foo_id} --local context=/context/simple-child --local dockerfile=/context/simple-child --output type=image,name=registry-cache:5000/foochild:bar,push=true --import-cache=type=registry,name=registry-cache:5000/cache/simplechild:0
 
 title "Pulling images to docker daemon for inspection"
 docker pull localhost:5000/foo:bar
 docker pull localhost:5000/foochild:bar
-docker images localhost:5000/*
 
-rebuild_original_foo_id=$(docker images localhost:5000/foo:bar -q)
-rebuild_original_foochild_id=$(docker images localhost:5000/foochild:bar -q)
+rebuild_original_foo_id=$(docker inspect --format='{{index .RepoDigests 0}}' localhost:5000/foo:bar | cut -d'@' -f 2)
+rebuild_original_foochild_id=$(docker inspect --format='{{index .RepoDigests 0}}' localhost:5000/foochild:bar | cut -d'@' -f 2)
 
 # Check if the images are the same
 if [ "$original_foo_id" != "$rebuild_original_foo_id" ]
 then
-  error "Base Image IDs do not match: ${original_foo_id} != ${rebuild_original_foo_id}"
+  error "Base Image digests do not match: ${original_foo_id} != ${rebuild_original_foo_id}"
   exit 1
 else
-    success "Base Image IDs match: ${original_foo_id} == ${rebuild_original_foo_id}"
+    success "Base Image digests match: ${original_foo_id} == ${rebuild_original_foo_id}"
 fi
 
 if [ "$original_foochild_id" != "$rebuild_original_foochild_id" ]
 then
-  error "Child Image IDs do not match: ${original_foochild_id} != ${rebuild_original_foochild_id}"
+  error "Child Image digests do not match: ${original_foochild_id} != ${rebuild_original_foochild_id}"
   exit 1
 else
-    success "Child Image IDs match: ${original_foochild_id} == ${rebuild_original_foochild_id}"
+    success "Child Image digests match: ${original_foochild_id} == ${rebuild_original_foochild_id}"
 fi
