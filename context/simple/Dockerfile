@@ -9,7 +9,3 @@ RUN sleep 2
 RUN echo hi > 1
 
 
-
-
-
-
