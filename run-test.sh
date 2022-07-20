@@ -3,39 +3,39 @@ set -e
 
 IMAGE=moby/buildkit:master-rootless
 
-title() {
-  echo $'=== \e[1m'$@$'\e[0m'
+info() {
+  echo $'=== \e[1m'$@$'\e[0m' >&2
 }
 
 error() {
-  echo $'\e[1;31m'$@$'\e[0m'
+  echo $'\e[1;31m'$@$'\e[0m' >&2
 }
 
 success() {
-  echo $'\e[1;32m'$@$'\e[0m'
+  echo $'\e[1;32m'$@$'\e[0m' >&2
 }
 
 start_registry() {
-    title "Start local registry for caching"
-    registry_cache=$(docker run -p 5000:5000 -d registry:2)
+    info "Start local registry for caching"
+    registry_cache=$(docker run -p 5000:5000 -d --name registry-cache registry:2)
 }
 
 stop_registry() {
   if [ -n "$registry_cache" ]
   then
-    title "Stop local registry for caching"
+    info "Stop local registry for caching"
     docker rm -vf $registry_cache
   fi
 }
 
 buildctl-daemonless() {
-    links="$links --link $registry_cache:registry-cache"
     docker run \
     --security-opt seccomp=unconfined \
     --security-opt apparmor=unconfined \
     -v $(pwd)/context:/context \
     -v $(pwd)/config.toml:/etc/buildkit/buildkitd.toml \
     -e BUILDKITD_FLAGS='--oci-worker-no-process-sandbox --config /etc/buildkit/buildkitd.toml' \
+    --link registry-cache:registry-cache \
     --rm \
     -ti \
     --entrypoint buildctl-daemonless.sh \
@@ -45,61 +45,82 @@ buildctl-daemonless() {
 }
 
 function cleanup {
-    removeImages || true
     stop_registry
+    sudo ctr -n original image rm $(sudo ctr -n original images ls -q)
+    sudo ctr -n original content rm $(sudo ctr -n original content ls -q)
 }
 
-removeImages() {
-    title "Removing images from docker daemon"
-    docker rmi $(docker images localhost:5000/* -a -q)
+pullAndInspectImage() {
+  namespace="${1}"
+  image="${2}"
+  sudo ctr -n ${namespace} image pull --plain-http ${image} >&2
+  image_id=$(sudo ctr -n ${namespace} images ls | grep ${image} | tr -s ' ' | cut -d ' ' -f 3)
+  manifest=$(sudo ctr -n ${namespace} content get "${image_id}")
+  #info "${1} manifest"
+  #echo "${manifest}" | jq . >&2
+  config_id=$(echo "${manifest}" | jq -r .config.digest)
+  #info "${1} image config"
+  #sudo ctr -n ${namespace} content get "${config_id}" | jq . >&2
+  echo "${image_id}"
+}
+
+comapreImages() {
+  namespace_one="${1}"
+  image_one="${2}"
+  namespace_two="${3}"
+  image_two="${4}"
+  info "Comparing manifests"
+  manifest_one=$(sudo ctr -n ${namespace_one} content get ${image_one})
+  manifest_two=$(sudo ctr -n ${namespace_two} content get ${image_two})
+  diff --new-line-format='+%L' --old-line-format='-%L' --unchanged-line-format=' %L' <( printf '%s\n' "${manifest_one}" ) <( printf '%s\n' "${manifest_two}" ) || true
+
+  info "Comparing configs"
+  config_one_id=$(echo "${manifest_one}" | jq -r .config.digest)
+  config_two_id=$(echo "${manifest_two}" | jq -r .config.digest)
+  config_one=$(sudo ctr -n ${namespace_one} content get "${config_one_id}" | jq .)
+  config_two=$(sudo ctr -n ${namespace_two} content get "${config_two_id}" | jq .)
+  diff --new-line-format='+%L' --old-line-format='-%L' --unchanged-line-format=' %L' <( printf '%s\n' "${config_one}" ) <( printf '%s\n' "${config_two}" ) || true
 }
 
 trap cleanup EXIT ERR
 
 start_registry
 
-title "Building and exporting parent image"
-buildctl-daemonless build . --frontend dockerfile.v0 --local context=/context/simple --local dockerfile=/context/simple --output type=image,name=registry-cache:5000/foo:bar,push=true --export-cache=type=registry,ref=registry-cache:5000/cache/simple:0
+info "Building and exporting image"
+buildctl-daemonless build . \
+  --frontend dockerfile.v0 \
+  --local context=/context \
+  --local dockerfile=/context \
+  --export-cache=type=registry,ref=registry-cache:5000/cache/image:debug  \
+  -t registry-cache:5000/leaf:debug \
+  --output=type=image,name=registry-cache:5000/image:debug,push=true \
+  --progress=plain \
+  --opt target=final
 
-title "Pulling images to docker daemon for inspection"
-docker pull localhost:5000/foo:bar
-original_foo_id=$(docker inspect --format='{{index .RepoDigests 0}}' localhost:5000/foo:bar | cut -d'@' -f 2)
+info "Pulling original image for inspection"
+original_id=$(pullAndInspectImage original localhost:5000/image:debug)
 
-title "Building and exporting child image"
-buildctl-daemonless build . --opt build-arg:BASE=registry-cache:5000/foo:bar@${original_foo_id} --frontend dockerfile.v0 --local context=/context/simple-child --local dockerfile=/context/simple-child --output type=image,name=registry-cache:5000/foochild:bar,push=true --export-cache=type=registry,name=registry-cache:5000/cache/simplechild:0
+info "Building (with import-from) image"
+buildctl-daemonless build . \
+  --frontend dockerfile.v0 \
+  --local context=/context \
+  --local dockerfile=/context \
+  --import-cache=type=registry,ref=registry-cache:5000/cache/image:debug \
+  --output type=image,name=registry-cache:5000/image:debug,push=true \
+  -t registry-cache:5000/image:debug \
+  --progress=plain \
+  --opt target=final
 
-title "Pulling images to docker daemon for inspection"
-docker pull localhost:5000/foochild:bar
-original_foochild_id=$(docker inspect --format='{{index .RepoDigests 0}}' localhost:5000/foochild:bar | cut -d'@' -f 2)
 
-removeImages
+info "Pulling rebuilt image for inspection"
+rebuild_id=$(pullAndInspectImage rebuild localhost:5000/image:debug)
 
-title "Building (with import-from) parent image"
-buildctl-daemonless build . --frontend dockerfile.v0 --local context=/context/simple --local dockerfile=/context/simple --output type=image,name=registry-cache:5000/foo:bar,push=true --import-cache=type=registry,ref=registry-cache:5000/cache/simple:0
-
-title "Building (with import-from) child image"
-buildctl-daemonless build . --frontend dockerfile.v0 --opt build-arg:BASE=registry-cache:5000/foo:bar@${original_foo_id} --local context=/context/simple-child --local dockerfile=/context/simple-child --output type=image,name=registry-cache:5000/foochild:bar,push=true --import-cache=type=registry,name=registry-cache:5000/cache/simplechild:0
-
-title "Pulling images to docker daemon for inspection"
-docker pull localhost:5000/foo:bar
-docker pull localhost:5000/foochild:bar
-
-rebuild_original_foo_id=$(docker inspect --format='{{index .RepoDigests 0}}' localhost:5000/foo:bar | cut -d'@' -f 2)
-rebuild_original_foochild_id=$(docker inspect --format='{{index .RepoDigests 0}}' localhost:5000/foochild:bar | cut -d'@' -f 2)
-
-# Check if the images are the same
-if [ "$original_foo_id" != "$rebuild_original_foo_id" ]
+# Check if original and rebuild ids match
+if [ "${original_id}" != "${rebuild_id}" ]
 then
-  error "Base Image digests do not match: ${original_foo_id} != ${rebuild_original_foo_id}"
+  error "original and rebuild image digests do not match: ${original_id} != ${rebuild_id}"
+  comapreImages original ${original_id} rebuild ${rebuild_id}
   exit 1
 else
-    success "Base Image digests match: ${original_foo_id} == ${rebuild_original_foo_id}"
-fi
-
-if [ "$original_foochild_id" != "$rebuild_original_foochild_id" ]
-then
-  error "Child Image digests do not match: ${original_foochild_id} != ${rebuild_original_foochild_id}"
-  exit 1
-else
-    success "Child Image digests match: ${original_foochild_id} == ${rebuild_original_foochild_id}"
+    success "original and rebuild image digests match: ${original_id} == ${rebuild_id}"
 fi

@@ -1,8 +1,23 @@
 ## Issue description
 
-`simple` folder contains a basic docker image with minimal commands. `simple-child` folder contains dockerfile which uses the image from `simple` as it's base image.
-We next build the 2 images and export them to a registry cache. Now when we clear the cache and try to build the 2 images again this time using the registry cache (using --import-cache), we expect that all the layers from both the images are found in the cache and the digests of the produced images match the digests of the images which were previously generated. We see that for the image in `simple` the digest matches and all the layers are found in the cache, however for the image in `simple-child`, 1 layer (RUN sleep command) is not found in the cache and it's digest differs from the 1 created in the 1st step.
+When building this simple [Dockerfile](./context/Dockerfile) and exporting the resulting layers to cache using `--export-cache`, one except that when the Dockerfile is rebuilt with importing the same cache using `--import-cache` that the resulting images from both the initial build and the rebuild would be the same. 
+
+However, the resulting images are not the same, due to a mismatch in the image config cause by a different `created` date on one of the layers, specifically the `COPY --from=builder /src/ /src/` on line 7.
 
 ## How to reproduce
 
 Clone this repository and run `make run`.
+
+This will start a local registry to use for importing and exporting the cache, as well as a source to inspect the images from.
+
+The script will build the image once and export the result to the registry cache, then will build it again but this time exporting the cache from the registry.
+
+Finally the script will compare the resulting images digest, and if different, runs a `diff` on both the image manifests and the image configs.
+
+## Requirements
+* bash
+* make
+* Docker
+* containerd
+* ctr 
+* diff
